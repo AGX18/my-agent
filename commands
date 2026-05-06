@@ -1,0 +1,21 @@
+# Commands
+
+```bash
+docker run --rm \
+  -p 7880:7880 \
+  -p 7881:7881 \
+  -p 7882:7882/udp \
+  livekit/livekit-server \
+  --dev \
+  --bind 0.0.0.0
+```
+
+```bash
+lk dispatch create \
+  --url ws://localhost:7880 \
+  --api-key devkey \
+  --api-secret secret \
+  --room test-room \
+  --agent-name "maya"
+
+```
