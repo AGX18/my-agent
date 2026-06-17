@@ -1,14 +1,24 @@
+from typing import ClassVar
+
 import pytest
 
 from agent import (
+    ASSISTANT_INSTRUCTIONS,
+    CallAnalysis,
     PropertySearchResult,
     RoomMetadata,
+    build_call_analysis,
+    build_call_payload,
+    duration_secs_from_session_report,
     extract_participant_metadata,
     extract_room_metadata,
     format_property_search_results,
     merge_metadata,
+    metadata_from_log_context,
+    persist_call_analysis,
     resolve_tenant_id,
     search_property_embeddings,
+    transcript_from_session_report,
 )
 
 
@@ -56,6 +66,227 @@ class FakeConnection:
 
     async def close(self):
         self.closed = True
+
+
+class FakePersistenceConnection:
+    pass
+
+
+class FakeHttpResponse:
+    status = 201
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return None
+
+    async def text(self) -> str:
+        return '{"id":100,"lead_id":55}'
+
+    async def json(self):
+        return {"id": 100, "lead_id": 55}
+
+
+class FakeHttpSession:
+    posted: ClassVar[dict] = {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return None
+
+    def post(self, url, *, json, headers):
+        self.__class__.posted = {
+            "url": url,
+            "json": json,
+            "headers": headers,
+        }
+        return FakeHttpResponse()
+
+
+def test_assistant_instructions_do_not_overpromise_unsupported_actions() -> None:
+    assert "do not currently have tools" in ASSISTANT_INSTRUCTIONS
+    assert "create appointments" in ASSISTANT_INSTRUCTIONS
+    assert "send WhatsApp messages" in ASSISTANT_INSTRUCTIONS
+    assert "share map pins" in ASSISTANT_INSTRUCTIONS
+    assert "Never say that you booked" in ASSISTANT_INSTRUCTIONS
+    assert "one of the brokers will contact them" in ASSISTANT_INSTRUCTIONS
+    assert "Do not say that you personally booked or scheduled it" in ASSISTANT_INSTRUCTIONS
+
+
+def test_transcript_from_session_report_extracts_messages() -> None:
+    transcript = transcript_from_session_report(
+        {
+            "history": {
+                "items": [
+                    {
+                        "role": "user",
+                        "content": ["عايز شقة في التجمع بميزانية خمسة مليون"],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": ["تمام، هدورلك على اختيارات مناسبة."],
+                    },
+                ]
+            }
+        }
+    )
+
+    assert "user: عايز شقة في التجمع بميزانية خمسة مليون" in transcript
+    assert "assistant: تمام، هدورلك على اختيارات مناسبة." in transcript
+
+
+def test_duration_secs_from_session_report_reads_top_level_duration() -> None:
+    assert duration_secs_from_session_report({"duration_secs": 42.8}) == 42
+
+
+def test_metadata_from_log_context_reads_tenant_and_phone() -> None:
+    metadata = metadata_from_log_context(
+        {
+            "tenant_id": "d600715c-4ba8-4e94-be2f-9db73abd7654",
+            "phone_number": "+201012345678",
+        }
+    )
+
+    assert metadata == RoomMetadata(
+        tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+        phone_number="+201012345678",
+    )
+
+
+def test_build_call_analysis_includes_client_wants_phone_status_and_labels() -> None:
+    analysis = build_call_analysis(
+        "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون، وعايز ثلاث غرف",
+        RoomMetadata(
+            tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+            phone_number="+201012345678",
+        ),
+        duration_secs=60,
+    )
+
+    assert analysis.sentiment == "positive"
+    assert analysis.outcome == "qualified"
+    assert analysis.lead_status == "qualified"
+    assert analysis.duration_secs == 60
+    assert "+201012345678" in analysis.details
+    assert "Budget:" in analysis.details
+    assert "Rooms:" in analysis.details
+    assert "Location:" in analysis.details
+    assert "Call outcome: qualified" in analysis.details
+    assert "Sentiment: positive" in analysis.summary
+
+
+def test_build_call_analysis_ignores_assistant_property_results() -> None:
+    analysis = build_call_analysis(
+        "\n".join(
+            [
+                "assistant: تمام، عايز تشتري فين؟ قولي المنطقة أو المدينة اللي في بالك.",
+                "assistant: تمام، لقيت دوبلكس للبيع في مدينة الرحاب المرحلة السابعة.",
+                "assistant: المساحة حوالي مية وتسعتاشر متر، تلات غرف نوم وتلات حمام، والسعر حوالي ستة مليون وستمية ألف جنيه.",
+                "user: شكرا، هفكر وارد عليك.",
+            ]
+        ),
+        RoomMetadata(
+            tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+            phone_number="+201012345678",
+        ),
+    )
+
+    assert "Budget: Not captured" in analysis.details
+    assert "Rooms: Not captured" in analysis.details
+    assert "Location: Not captured" in analysis.details
+    assert "Property type: Not captured" in analysis.details
+    assert analysis.sentiment == "neutral"
+    assert analysis.outcome == "follow_up"
+
+
+def test_build_call_analysis_uses_only_client_preferences() -> None:
+    analysis = build_call_analysis(
+        "\n".join(
+            [
+                "assistant: السعر حوالي ستة مليون وستمية ألف جنيه وفيه تلات غرف.",
+                "user: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف.",
+            ]
+        ),
+        RoomMetadata(phone_number="+201012345678"),
+    )
+
+    assert (
+        "Budget: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف."
+        in analysis.details
+    )
+    assert (
+        "Rooms: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف."
+        in analysis.details
+    )
+    assert (
+        "Location: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف."
+        in analysis.details
+    )
+    assert (
+        "Property type: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف."
+        in analysis.details
+    )
+    assert "ستة مليون وستمية" not in analysis.details
+
+
+@pytest.mark.asyncio
+async def test_persist_call_analysis_posts_to_backend_endpoint() -> None:
+    analysis = CallAnalysis(
+        transcript="user: عايز شقة في التجمع",
+        details="Phone number: +201012345678\nCall outcome: qualified",
+        summary="Call with +201012345678. Outcome: qualified. Sentiment: positive.",
+        sentiment="positive",
+        outcome="qualified",
+        lead_status="qualified",
+        duration_secs=90,
+    )
+
+    call_id, lead_id = await persist_call_analysis(
+        "d600715c-4ba8-4e94-be2f-9db73abd7654",
+        "+201012345678",
+        analysis,
+        backend_base_url="https://backend.example.com",
+        session_factory=FakeHttpSession,
+    )
+
+    assert (call_id, lead_id) == (100, 55)
+    assert (
+        FakeHttpSession.posted["url"]
+        == "https://backend.example.com/tenants/d600715c-4ba8-4e94-be2f-9db73abd7654/calls"
+    )
+    assert FakeHttpSession.posted["headers"] == {"Content-Type": "application/json"}
+    assert FakeHttpSession.posted["json"] == {
+        "phone_number": "+201012345678",
+        "status": "qualified",
+        "lead_status": "qualified",
+        "transcript": analysis.transcript,
+        "details": analysis.details,
+        "summary": analysis.summary,
+        "sentiment": "positive",
+        "outcome": "qualified",
+        "duration_secs": 90,
+    }
+
+
+def test_build_call_payload_includes_phone_number_and_status() -> None:
+    analysis = CallAnalysis(
+        transcript="transcript",
+        details="details",
+        summary="summary",
+        sentiment="neutral",
+        outcome="follow_up",
+        lead_status="Follow_Up",
+    )
+
+    payload = build_call_payload("+201012345678", analysis)
+
+    assert payload["phone_number"] == "+201012345678"
+    assert "phone" not in payload
+    assert payload["status"] == "Follow_Up"
+    assert payload["lead_status"] == "Follow_Up"
 
 
 @pytest.mark.asyncio
@@ -114,14 +345,13 @@ def test_extract_participant_metadata_reads_snake_case_values() -> None:
     )
 
 
-def test_extract_room_metadata_reads_camel_case_values() -> None:
+def test_extract_room_metadata_reads_camel_case_tenant_only() -> None:
     metadata = extract_room_metadata(
         '{"tenantId":"550e8400-e29b-41d4-a716-446655440000","phoneNumber":"+201001112222"}'
     )
 
     assert metadata == RoomMetadata(
         tenant_id="550e8400-e29b-41d4-a716-446655440000",
-        phone_number="+201001112222",
     )
 
 
