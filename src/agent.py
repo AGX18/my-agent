@@ -314,21 +314,17 @@ def build_call_analysis(
     *,
     duration_secs: int | None = None,
 ) -> CallAnalysis:
-    client_transcript = _client_transcript(transcript)
-    sentiment = _classify_sentiment(client_transcript)
-    outcome = _classify_outcome(client_transcript)
-    lead_status = OUTCOME_TO_LEAD_STATUS[outcome]
-    preferences = _extract_client_preferences(client_transcript)
-    details = _format_call_details(metadata, preferences, sentiment, outcome)
-    summary = _format_call_summary(metadata, preferences, sentiment, outcome)
-
+    # TODO: Implement call summary extraction here.
+    # Build the final transcript, details, summary, sentiment, outcome, and
+    # lead_status from the session transcript and participant metadata.
+    del metadata
     return CallAnalysis(
         transcript=transcript,
-        details=details,
-        summary=summary,
-        sentiment=sentiment,
-        outcome=outcome,
-        lead_status=lead_status,
+        details="TODO: implement call details",
+        summary="TODO: implement call summary",
+        sentiment="neutral",
+        outcome=DEFAULT_CALL_OUTCOME,
+        lead_status=DEFAULT_LEAD_STATUS,
         duration_secs=duration_secs,
     )
 
@@ -397,109 +393,6 @@ def _content_to_text(content: Any) -> str:
     if isinstance(content, list):
         return " ".join(item for item in content if isinstance(item, str)).strip()
     return ""
-
-
-def _client_transcript(transcript: str) -> str:
-    client_lines = []
-    for line in transcript.splitlines():
-        role, _, content = line.partition(":")
-        normalized_role = role.strip().lower()
-        if normalized_role in {"user", "client", "customer"} and content.strip():
-            client_lines.append(content.strip())
-        elif ":" not in line and line.strip():
-            client_lines.append(line.strip())
-    return "\n".join(client_lines)
-
-
-def _extract_client_preferences(transcript: str) -> dict[str, str]:
-    return {
-        "budget": _find_matching_line(
-            transcript,
-            ("budget", "ميزانية", "ميزانيتي", "مليون", "الف", "ألف", "جنيه"),
-        ),
-        "rooms": _find_matching_line(
-            transcript,
-            ("room", "rooms", "bedroom", "غرفة", "غرف", "اوض", "أوض"),
-        ),
-        "location": _find_matching_line(
-            transcript,
-            ("location", "area", "district", "منطقة", "مكان", "القاهرة", "التجمع"),
-        ),
-        "property_type": _find_matching_line(
-            transcript,
-            ("apartment", "villa", "studio", "شقة", "فيلا", "دوبلكس", "استوديو"),
-        ),
-    }
-
-
-def _find_matching_line(transcript: str, keywords: tuple[str, ...]) -> str:
-    for line in transcript.splitlines():
-        normalized_line = line.lower()
-        if any(keyword.lower() in normalized_line for keyword in keywords):
-            return line.strip()
-    return "Not captured"
-
-
-def _classify_sentiment(transcript: str) -> str:
-    normalized = transcript.lower()
-    negative_keywords = ("مش مناسب", "غالي", "سيء", "وحش", "رفض", "negative")
-    positive_keywords = ("مهتم", "ممتاز", "تمام", "حلو", "عجب", "positive")
-
-    if any(keyword in normalized for keyword in negative_keywords):
-        return "negative"
-    if any(keyword in normalized for keyword in positive_keywords):
-        return "positive"
-    return "neutral"
-
-
-def _classify_outcome(transcript: str) -> str:
-    normalized = transcript.lower()
-    if not normalized.strip():
-        return "no_answer"
-    if any(keyword in normalized for keyword in ("اشتريت", "closed", "تم البيع")):
-        return "closed"
-    if any(keyword in normalized for keyword in ("غير مؤهل", "unqualified")):
-        return "unqualified"
-    if any(
-        keyword in normalized for keyword in ("مهتم", "ميزانية", "budget", "qualified")
-    ):
-        return "qualified"
-    return DEFAULT_CALL_OUTCOME
-
-
-def _format_call_details(
-    metadata: RoomMetadata,
-    preferences: dict[str, str],
-    sentiment: str,
-    outcome: str,
-) -> str:
-    return "\n".join(
-        [
-            f"Phone number: {metadata.phone_number or 'Not captured'}",
-            f"Budget: {preferences['budget']}",
-            f"Rooms: {preferences['rooms']}",
-            f"Location: {preferences['location']}",
-            f"Property type: {preferences['property_type']}",
-            f"Sentiment: {sentiment}",
-            f"Call outcome: {outcome}",
-        ]
-    )
-
-
-def _format_call_summary(
-    metadata: RoomMetadata,
-    preferences: dict[str, str],
-    sentiment: str,
-    outcome: str,
-) -> str:
-    return (
-        f"Call with {metadata.phone_number or 'unknown phone number'}. "
-        f"Client budget: {preferences['budget']}. "
-        f"Rooms: {preferences['rooms']}. "
-        f"Location: {preferences['location']}. "
-        f"Property type: {preferences['property_type']}. "
-        f"Outcome: {outcome}. Sentiment: {sentiment}."
-    )
 
 
 class Assistant(Agent):
@@ -626,16 +519,6 @@ async def my_agent(ctx: JobContext):
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
-
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
 
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(

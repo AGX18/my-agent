@@ -68,10 +68,6 @@ class FakeConnection:
         self.closed = True
 
 
-class FakePersistenceConnection:
-    pass
-
-
 class FakeHttpResponse:
     status = 201
 
@@ -113,7 +109,10 @@ def test_assistant_instructions_do_not_overpromise_unsupported_actions() -> None
     assert "share map pins" in ASSISTANT_INSTRUCTIONS
     assert "Never say that you booked" in ASSISTANT_INSTRUCTIONS
     assert "one of the brokers will contact them" in ASSISTANT_INSTRUCTIONS
-    assert "Do not say that you personally booked or scheduled it" in ASSISTANT_INSTRUCTIONS
+    assert (
+        "Do not say that you personally booked or scheduled it"
+        in ASSISTANT_INSTRUCTIONS
+    )
 
 
 def test_transcript_from_session_report_extracts_messages() -> None:
@@ -156,7 +155,7 @@ def test_metadata_from_log_context_reads_tenant_and_phone() -> None:
     )
 
 
-def test_build_call_analysis_includes_client_wants_phone_status_and_labels() -> None:
+def test_build_call_analysis_is_todo_stub() -> None:
     analysis = build_call_analysis(
         "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون، وعايز ثلاث غرف",
         RoomMetadata(
@@ -166,70 +165,15 @@ def test_build_call_analysis_includes_client_wants_phone_status_and_labels() -> 
         duration_secs=60,
     )
 
-    assert analysis.sentiment == "positive"
-    assert analysis.outcome == "qualified"
-    assert analysis.lead_status == "qualified"
-    assert analysis.duration_secs == 60
-    assert "+201012345678" in analysis.details
-    assert "Budget:" in analysis.details
-    assert "Rooms:" in analysis.details
-    assert "Location:" in analysis.details
-    assert "Call outcome: qualified" in analysis.details
-    assert "Sentiment: positive" in analysis.summary
-
-
-def test_build_call_analysis_ignores_assistant_property_results() -> None:
-    analysis = build_call_analysis(
-        "\n".join(
-            [
-                "assistant: تمام، عايز تشتري فين؟ قولي المنطقة أو المدينة اللي في بالك.",
-                "assistant: تمام، لقيت دوبلكس للبيع في مدينة الرحاب المرحلة السابعة.",
-                "assistant: المساحة حوالي مية وتسعتاشر متر، تلات غرف نوم وتلات حمام، والسعر حوالي ستة مليون وستمية ألف جنيه.",
-                "user: شكرا، هفكر وارد عليك.",
-            ]
-        ),
-        RoomMetadata(
-            tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
-            phone_number="+201012345678",
-        ),
+    assert analysis.transcript == (
+        "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون، وعايز ثلاث غرف"
     )
-
-    assert "Budget: Not captured" in analysis.details
-    assert "Rooms: Not captured" in analysis.details
-    assert "Location: Not captured" in analysis.details
-    assert "Property type: Not captured" in analysis.details
+    assert analysis.details == "TODO: implement call details"
+    assert analysis.summary == "TODO: implement call summary"
     assert analysis.sentiment == "neutral"
     assert analysis.outcome == "follow_up"
-
-
-def test_build_call_analysis_uses_only_client_preferences() -> None:
-    analysis = build_call_analysis(
-        "\n".join(
-            [
-                "assistant: السعر حوالي ستة مليون وستمية ألف جنيه وفيه تلات غرف.",
-                "user: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف.",
-            ]
-        ),
-        RoomMetadata(phone_number="+201012345678"),
-    )
-
-    assert (
-        "Budget: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف."
-        in analysis.details
-    )
-    assert (
-        "Rooms: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف."
-        in analysis.details
-    )
-    assert (
-        "Location: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف."
-        in analysis.details
-    )
-    assert (
-        "Property type: ميزانيتي خمسة مليون وعايز شقة في التجمع من تلات غرف."
-        in analysis.details
-    )
-    assert "ستة مليون وستمية" not in analysis.details
+    assert analysis.lead_status == "Follow_Up"
+    assert analysis.duration_secs == 60
 
 
 @pytest.mark.asyncio
