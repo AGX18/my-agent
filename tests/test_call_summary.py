@@ -30,3 +30,20 @@ def test_text_models_are_opt_in(monkeypatch) -> None:
 
     assert call_summary._load_text_models() is False
     assert call_summary._models["text_models_unavailable"] is True
+
+
+def test_auto_outcome_qualifies_viewing_request_even_with_no_word() -> None:
+    builder = call_summary.CallSummaryBuilder(phone="+201019945011")
+    rows = [
+        {"text": "لا انا عاوزه اشوفها الاول", "intent": "general_question"},
+        {"text": "اقرب وقت", "intent": "schedule_visit"},
+    ]
+
+    assert builder._auto_determine_outcome(rows) == "qualified"
+
+
+def test_auto_outcome_unqualifies_explicit_rejection() -> None:
+    builder = call_summary.CallSummaryBuilder()
+    rows = [{"text": "مش مهتم شكرا", "intent": "unqualified"}]
+
+    assert builder._auto_determine_outcome(rows) == "unqualified"

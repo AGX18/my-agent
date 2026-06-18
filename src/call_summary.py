@@ -273,10 +273,25 @@ _INTENT_PATTERNS = {
         "حجز",
         "عايز",
     ],
+    "schedule_visit": [
+        "viewing",
+        "visit",
+        "see it",
+        "appointment",
+        "معاينة",
+        "اعاين",
+        "اشوف",
+        "اشوفها",
+        "شوفها",
+        "أشوف",
+        "أشوفها",
+        "اقرب وقت",
+        "أقرب وقت",
+    ],
     "ask_location": ["where", "location", "area", "فين", "منطقة", "موقع", "مكان"],
     "ask_size": ["size", "meter", "sqm", "متر", "مساحة"],
     "ask_rooms": ["rooms", "bedroom", "غرف", "غرفة", "أوضة", "أوض"],
-    "unqualified": ["no", "not interested", "مش مهتم", "لأ", "مش محتاج", "بلاش"],
+    "unqualified": ["not interested", "مش مهتم", "مش محتاج", "بلاش"],
     "objection_price": ["expensive", "costly", "غالي", "ده كتير", "أغلى", "مش قادر"],
     "interest_show": ["nice", "good", "interested", "حلو", "تمام", "عجبني", "ممتاز"],
 }
@@ -558,45 +573,63 @@ class CallSummaryBuilder:
 
     def _auto_determine_outcome(self, timeline_rows: list[dict]) -> str:
         """
-        Determine call outcome from intent distribution in the timeline.
-        Called automatically in finalize() when outcome is still 'ongoing'.
+        تحديد النتيجة بناءً على قواعد عمل صارمة تليها تقييم ذكي للمحادثة.
         """
+        # 1. تجميع النصوص لسهولة البحث
+        full_text = " ".join([row.get("text", "").lower() for row in timeline_rows])
+
+        # 2. القاعدة الصارمة: النجاح (الاهتمام)
+        # إذا قدم العميل رقم هاتفه، فهو "Qualified" تلقائياً
+        if self.phone:
+            return "qualified"
+
+        # 3. القاعدة الصارمة: الرفض القاطع
+        # الرفض يجب أن يكون واضحاً، وليس مجرد "لا" داخل سياق اهتمام.
+        negative_signals = ["مش مهتم", "مش عايز", "مش محتاج", "بلاش", "مش مناسب"]
+        if any(signal in full_text for signal in negative_signals):
+            return "unqualified"
+
+        positive_signals = [
+            "عايز",
+            "عاوزه",
+            "مهتم",
+            "عجباني",
+            "عجبني",
+            "حلو",
+            "اشوف",
+            "اشوفها",
+            "أشوف",
+            "أشوفها",
+            "معاينة",
+            "اعاين",
+            "اقرب وقت",
+            "أقرب وقت",
+        ]
+        if any(signal in full_text for signal in positive_signals):
+            return "qualified"
+
+        # 4. تقييم ذكي (LLM) للحالات الرمادية
+        # إذا لم يرفض ولم يعطِ رقماً، نترك الموديل يحلل النوايا
         if not timeline_rows:
             return "unknown"
 
         intent_counts = Counter(row.get("intent", "unknown") for row in timeline_rows)
 
-        prompt = f"""أنت محلل مبيعات عقاري.
-
-بناءً على توزيع نوايا العميل خلال المحادثة:
-{json.dumps(intent_counts, ensure_ascii=False)}
-
-حدد النتيجة النهائية للمكالمة.
-أرجع كلمة واحدة فقط من هذه الخيارات:
-- unqualified : العميل رفض أو غير مهتم
-- qualified     : العميل مهتم لكن لم يحجز
-- follow_up       : العميل طلب المتابعة لاحقاً
-
-كلمة واحدة فقط، بدون أي شرح."""
+        prompt = f"""أنت محلل مبيعات عقاري خبير.
+        بناءً على توزيع النوايا التالي: {json.dumps(intent_counts, ensure_ascii=False)}
+        بما أن العميل لم يرفض صراحةً ولم يعطِ رقم هاتف، هل يميل العميل للـ qualified (اهتمام بطلب معلومات) أم unqualified؟
+        أرجع كلمة واحدة فقط: qualified أو unqualified."""
 
         try:
             response = _models["summary_llm"].chat.completions.create(
                 model="gpt-4o-mini",
                 temperature=0.3,
-                max_tokens=600,
                 messages=[{"role": "user", "content": prompt}],
             )
-            outcome = response.choices[0].message.content.strip().lower()
-            if "unqualified" in outcome:
-                return "unqualified"
-            if "follow_up" in outcome:
-                return "follow_up"
-            if "qualified" in outcome:
-                return "qualified"
-            return "unknown"
+            return response.choices[0].message.content.strip().lower()
         except Exception as e:
-            logger.warning(f"⚠️ Auto outcome detection failed: {e}")
-            return "unknown"
+            logger.warning(f"⚠️ Auto outcome fallback failed: {e}")
+            return "qualified"  # الافتراض الآمن للمتابعة بدلاً من ضياع الفرصة
 
     def _derive_overall_intent(self, timeline_rows: list[dict]) -> str:
         """
@@ -848,7 +881,10 @@ def print_report(report: dict) -> None:
     print("\n" + "=" * 60)
     print("📊 CALL ANALYSIS REPORT")
     print("=" * 60)
-    s = report["summary"]
+
+    # report هو القاموس الناتج من finalize() مباشرة
+    s = report
+
     print(f"  Call ID         : {s.get('call_id', 'N/A')}")
     print(f"  Client          : {s.get('client_name', 'N/A')}")
     print(f"  Outcome         : {s.get('call_outcome', 'N/A')}")
@@ -926,4 +962,4 @@ if __name__ == "__main__":
 
     # ── Full pipeline test (requires models + OpenAI key) ──
     # Uncomment the line below to run the full call analysis:
-    # print_report(report)
+    print_report(report)

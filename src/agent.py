@@ -16,6 +16,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     RunContext,
+    TurnHandlingOptions,
     cli,
     function_tool,
     inference,
@@ -561,6 +562,8 @@ async def persist_call_analysis(
     if backend_api_key:
         headers["Authorization"] = f"Bearer {backend_api_key}"
 
+    logger.info("CALL_PAYLOAD_V3 %s", json.dumps(payload, ensure_ascii=False))
+
     async with (
         session_factory() as session,
         session.post(url, json=payload, headers=headers) as response,
@@ -599,12 +602,14 @@ def build_call_payload(
     }
 
 
-def build_turn_handling_options(turn_detector) -> dict[str, Any]:
-    return {
-        "turn_detection": turn_detector,
-        "interruption": {"mode": "vad"},
-        "preemptive_generation": {"enabled": True},
-    }
+def build_turn_handling_options(turn_detector) -> TurnHandlingOptions:
+    return TurnHandlingOptions(
+        {
+            "turn_detection": turn_detector,
+            "interruption": {"mode": "vad"},
+            "preemptive_generation": {"enabled": True},
+        }
+    )
 
 
 def _content_to_text(content: Any) -> str:
