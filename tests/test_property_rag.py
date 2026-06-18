@@ -9,6 +9,7 @@ from agent import (
     RoomMetadata,
     build_call_analysis,
     build_call_payload,
+    build_turn_handling_options,
     duration_secs_from_session_report,
     extract_participant_metadata,
     extract_room_metadata,
@@ -432,6 +433,18 @@ def test_build_call_payload_includes_phone_number_and_status() -> None:
     assert "phone" not in payload
     assert payload["status"] == "Follow_Up"
     assert payload["lead_status"] == "Follow_Up"
+
+
+def test_build_turn_handling_options_uses_vad_interruption_mode() -> None:
+    turn_detector = object()
+
+    options = build_turn_handling_options(turn_detector)
+
+    assert options == {
+        "turn_detection": turn_detector,
+        "interruption": {"mode": "vad"},
+        "preemptive_generation": {"enabled": True},
+    }
 
 
 @pytest.mark.asyncio

@@ -220,7 +220,7 @@ async def lookup_tenant_id_by_name(
             """
             SELECT id
             FROM tenants
-            WHERE name = lower($1)
+            WHERE lower(name) = lower($1)
             LIMIT 1
             """,
             tenant_name.strip(),
@@ -599,6 +599,14 @@ def build_call_payload(
     }
 
 
+def build_turn_handling_options(turn_detector) -> dict[str, Any]:
+    return {
+        "turn_detection": turn_detector,
+        "interruption": {"mode": "vad"},
+        "preemptive_generation": {"enabled": True},
+    }
+
+
 def _content_to_text(content: Any) -> str:
     if isinstance(content, str):
         return content.strip()
@@ -736,12 +744,9 @@ async def my_agent(ctx: JobContext):
         tts=inference.TTS(model="xai/tts-1", voice="ara", language="ar-EG"),
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
         # See more at https://docs.livekit.io/agents/build/turns
-        turn_detection=MultilingualModel(),
+        turn_handling=build_turn_handling_options(MultilingualModel()),
         vad=ctx.proc.userdata["vad"],
         userdata=session_metadata,
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
-        preemptive_generation=True,
     )
 
     # Start the session, which initializes the voice pipeline and warms up the models
