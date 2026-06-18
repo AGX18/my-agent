@@ -11,9 +11,12 @@ requires-python = ">=3.10, <3.15"
 dependencies = [
     "aiohttp>=3.13.5",
     "asyncpg>=0.31.0",
+    "langdetect>=1.0.9",
     "livekit-agents[silero,turn-detector]~=1.5",
     "livekit-plugins-ai-coustics~=0.2",
+    "openai>=2.0.0",
     "python-dotenv",
+    "torch>=2.12.1",
 ]
 
 [dependency-groups]
@@ -44,3 +47,13 @@ ignore = ["E501"]  # Line too long (handled by formatter)
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

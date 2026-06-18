@@ -1,3 +1,4 @@
+import json
 from typing import ClassVar
 
 import pytest
@@ -155,25 +156,112 @@ def test_metadata_from_log_context_reads_tenant_and_phone() -> None:
     )
 
 
-def test_build_call_analysis_is_todo_stub() -> None:
+class FakeCallSummaryBuilder:
+    def __init__(self, phone=None):
+        self.phone = phone
+        self.turns = []
+        self.outcome = None
+
+    def add_turn(self, role: str, text: str) -> None:
+        self.turns.append((role, text.strip()))
+
+    def set_outcome(self, outcome: str) -> None:
+        self.outcome = outcome
+
+    def finalize(self):
+        assert self.outcome == "ongoing"
+        assert self.turns == [
+            ("user", "انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون"),
+            ("agent", "تمام، محتاج كام غرفة؟"),
+            ("user", "ثلاث غرف ورقمي 01012345678"),
+        ]
+        return {
+            "phone": self.phone or "01012345678",
+            "call_id": "call-123",
+            "called_at": "2026-06-18T10:00:00",
+            "summary": "العميل مهتم بشقة في التجمع بميزانية خمسة مليون.",
+            "call_outcome": "qualified",
+            "dominant_emotion": "positive",
+            "overall_intent": "buy_property",
+            "hesitation_rate": "0.0%",
+            "total_user_turns": 2,
+            "qualification": {
+                "area": "التجمع",
+                "bedrooms": 3,
+                "budget": "5000000",
+            },
+        }
+
+
+def test_build_call_analysis_maps_call_summary_to_backend_fields() -> None:
     analysis = build_call_analysis(
-        "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون، وعايز ثلاث غرف",
+        "\n".join(
+            [
+                "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون",
+                "assistant: تمام، محتاج كام غرفة؟",
+                "user: ثلاث غرف ورقمي 01012345678",
+            ]
+        ),
+        RoomMetadata(
+            tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+            phone_number=None,
+        ),
+        duration_secs=60,
+        summary_builder_cls=FakeCallSummaryBuilder,
+    )
+
+    assert analysis.phone_number == "01012345678"
+    assert analysis.summary == "العميل مهتم بشقة في التجمع بميزانية خمسة مليون."
+    assert analysis.sentiment == "positive"
+    assert analysis.outcome == "qualified"
+    assert analysis.lead_status == "qualified"
+    assert analysis.duration_secs == 60
+
+    details = json.loads(analysis.details)
+    assert details["phone_number"] == "01012345678"
+    assert details["call_id"] == "call-123"
+    assert details["overall_intent"] == "buy_property"
+    assert details["qualification"] == {
+        "area": "التجمع",
+        "bedrooms": 3,
+        "budget": "5000000",
+    }
+
+    payload = build_call_payload(None, analysis)
+    assert payload == {
+        "phone_number": "01012345678",
+        "status": "qualified",
+        "lead_status": "qualified",
+        "transcript": analysis.transcript,
+        "details": analysis.details,
+        "summary": analysis.summary,
+        "sentiment": "positive",
+        "outcome": "qualified",
+        "duration_secs": 60,
+    }
+
+
+def test_build_call_analysis_falls_back_when_summary_builder_fails() -> None:
+    class FailingCallSummaryBuilder:
+        def __init__(self, phone=None):
+            raise ModuleNotFoundError("No module named 'torch'")
+
+    analysis = build_call_analysis(
+        "user: عايز شقة في التجمع",
         RoomMetadata(
             tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
             phone_number="+201012345678",
         ),
-        duration_secs=60,
+        duration_secs=30,
+        summary_builder_cls=FailingCallSummaryBuilder,
     )
 
-    assert analysis.transcript == (
-        "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون، وعايز ثلاث غرف"
-    )
-    assert analysis.details == "TODO: implement call details"
-    assert analysis.summary == "TODO: implement call summary"
+    assert analysis.phone_number == "+201012345678"
+    assert analysis.summary == "No call summary was generated."
     assert analysis.sentiment == "neutral"
     assert analysis.outcome == "follow_up"
     assert analysis.lead_status == "Follow_Up"
-    assert analysis.duration_secs == 60
+    assert analysis.duration_secs == 30
 
 
 @pytest.mark.asyncio

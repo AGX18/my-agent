@@ -36,7 +36,7 @@ DEFAULT_CALL_OUTCOME = "follow_up"
 DEFAULT_LEAD_STATUS = "Follow_Up"
 CALL_SENTIMENTS = {"positive", "negative", "neutral"}
 CALL_OUTCOMES = {"follow_up", "qualified", "closed", "unqualified", "no_answer"}
-LEAD_STATUSES = {"Follow_Up", "qualified", "closed", "unqualified"}
+LEAD_STATUSES = {"follow_up", "qualified", "closed", "unqualified"}
 OUTCOME_TO_LEAD_STATUS = {
     "follow_up": "Follow_Up",
     "qualified": "qualified",
@@ -117,6 +117,7 @@ class CallAnalysis:
     outcome: str
     lead_status: str
     duration_secs: int | None = None
+    phone_number: str | None = None
 
 
 def extract_room_metadata(metadata: str | None) -> RoomMetadata:
@@ -308,23 +309,107 @@ def duration_secs_from_session_report(report: dict[str, Any]) -> int | None:
     return None
 
 
+def _call_summary_builder_class():
+    from call_summary import CallSummaryBuilder
+
+    return CallSummaryBuilder
+
+
+def _summary_role(role: str) -> str:
+    normalized = role.strip().lower()
+    if normalized in {"user", "client", "customer", "العميل"}:
+        return "user"
+    return "agent"
+
+def _add_duration_secs_to_summary_builder(builder: Any, durations_secs) -> None:
+    builder.set_duration_secs(durations_secs)
+    
+
+def _add_transcript_to_summary_builder(builder: Any, transcript: str) -> None:
+    for line in transcript.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        role, separator, text = line.partition(":")
+        if separator:
+            builder.add_turn(_summary_role(role), text)
+        else:
+            builder.add_turn("user", line)
+
+
+def _normalize_sentiment(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if "pos" in text or text in {"happy", "joy", "interest_show"}:
+        return "positive"
+    if "neg" in text or text in {"anger", "sadness", "fear", "disgust"}:
+        return "negative"
+    if text in CALL_SENTIMENTS:
+        return text
+    return "neutral"
+
+
+def _normalize_outcome(value: Any) -> str:
+    outcome = str(value or "").strip().lower()
+    if outcome in CALL_OUTCOMES:
+        return outcome
+    return DEFAULT_CALL_OUTCOME
+
+
+def _build_call_details(summary: dict[str, Any], phone_number: str | None) -> str:
+    details = {
+        "phone_number": phone_number,
+        "call_id": summary.get("call_id"),
+        "called_at": summary.get("called_at") or summary.get("timestamp"),
+        "call_outcome": summary.get("call_outcome"),
+        "overall_intent": summary.get("overall_intent"),
+        "dominant_emotion": summary.get("dominant_emotion"),
+        "hesitation_rate": summary.get("hesitation_rate"),
+        "total_user_turns": summary.get("total_user_turns"),
+        "qualification": summary.get("qualification") or {},
+    }
+    return json.dumps(details, ensure_ascii=False)
+
+
 def build_call_analysis(
     transcript: str,
     metadata: RoomMetadata,
     *,
     duration_secs: int | None = None,
+    summary_builder_cls=None,
 ) -> CallAnalysis:
-    # TODO: Implement call summary extraction here.
-    # Build the final transcript, details, summary, sentiment, outcome, and
-    # lead_status from the session transcript and participant metadata.
-    del metadata
+    summary_data: dict[str, Any]
+    try:
+        builder_cls = summary_builder_cls or _call_summary_builder_class()
+        builder = builder_cls(phone=metadata.phone_number or None)
+        builder.set_outcome("ongoing")
+        _add_transcript_to_summary_builder(builder, transcript)   
+        _add_duration_secs_to_summary_builder(builder, duration_secs)
+        summary_data = builder.finalize()
+    except Exception:
+        logger.exception("Call summary analysis failed")
+        summary_data = {}
+
+    phone_number = metadata.phone_number or summary_data.get("phone")
+    outcome = _normalize_outcome(
+        summary_data.get("call_outcome") or summary_data.get("classification")
+    )
+    lead_status = OUTCOME_TO_LEAD_STATUS.get(outcome, DEFAULT_LEAD_STATUS)
+    sentiment = _normalize_sentiment(summary_data.get("dominant_emotion"))
+    summary_text = (
+        summary_data.get("summary")
+        or summary_data.get("llm_summary")
+        or "No call summary was generated."
+    )
+
     return CallAnalysis(
+        phone_number=phone_number,
         transcript=transcript,
-        details="TODO: implement call details",
-        summary="TODO: implement call summary",
-        sentiment="neutral",
-        outcome=DEFAULT_CALL_OUTCOME,
-        lead_status=DEFAULT_LEAD_STATUS,
+        details=_build_call_details(summary_data, phone_number),
+        summary=str(summary_text),
+        sentiment=sentiment,
+        outcome=outcome,
+        lead_status=lead_status,
         duration_secs=duration_secs,
     )
 
@@ -375,7 +460,7 @@ def build_call_payload(
     analysis: CallAnalysis,
 ) -> dict[str, Any]:
     return {
-        "phone_number": phone_number,
+        "phone_number": phone_number or analysis.phone_number,
         "status": analysis.lead_status,
         "lead_status": analysis.lead_status,
         "transcript": analysis.transcript,
@@ -458,7 +543,7 @@ async def on_session_end(ctx: JobContext) -> None:
     try:
         call_id, lead_id = await persist_call_analysis(
             metadata.tenant_id,
-            metadata.phone_number,
+            metadata.phone_number or analysis.phone_number,
             analysis,
         )
     except Exception:
