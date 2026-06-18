@@ -1,4 +1,3 @@
-import json
 from typing import ClassVar
 
 import pytest
@@ -17,6 +16,7 @@ from agent import (
     merge_metadata,
     metadata_from_log_context,
     persist_call_analysis,
+    resolve_session_metadata_tenant_id,
     resolve_tenant_id,
     search_property_embeddings,
     transcript_from_session_report,
@@ -53,6 +53,7 @@ class FakeRunContext:
 class FakeConnection:
     def __init__(self) -> None:
         self.fetch_args = None
+        self.fetchrow_args = None
         self.closed = False
 
     async def fetch(self, *args):
@@ -64,6 +65,10 @@ class FakeConnection:
                 "similarity": 0.91,
             }
         ]
+
+    async def fetchrow(self, *args):
+        self.fetchrow_args = args
+        return {"id": "550e8400-e29b-41d4-a716-446655440000"}
 
     async def close(self):
         self.closed = True
@@ -142,16 +147,61 @@ def test_duration_secs_from_session_report_reads_top_level_duration() -> None:
     assert duration_secs_from_session_report({"duration_secs": 42.8}) == 42
 
 
+def test_duration_secs_from_session_report_reads_usage_duration_key() -> None:
+    assert (
+        duration_secs_from_session_report({"usage": {"call_duration_secs": 91.2}}) == 91
+    )
+
+
+def test_duration_secs_from_session_report_reads_nested_duration() -> None:
+    assert (
+        duration_secs_from_session_report(
+            {"session": {"metrics": {"duration_seconds": 125.9}}}
+        )
+        == 125
+    )
+
+
 def test_metadata_from_log_context_reads_tenant_and_phone() -> None:
     metadata = metadata_from_log_context(
         {
             "tenant_id": "d600715c-4ba8-4e94-be2f-9db73abd7654",
+            "tenant_name": "Demo Tenant",
             "phone_number": "+201012345678",
         }
     )
 
     assert metadata == RoomMetadata(
         tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+        tenant_name="Demo Tenant",
+        phone_number="+201012345678",
+    )
+
+
+def test_extract_metadata_reads_tenant_name_aliases() -> None:
+    metadata = extract_participant_metadata(
+        '{"tenantName":"Demo Tenant","phone_number":"+201012345678"}'
+    )
+
+    assert metadata == RoomMetadata(
+        tenant_name="Demo Tenant",
+        phone_number="+201012345678",
+    )
+
+
+def test_merge_metadata_keeps_primary_tenant_name() -> None:
+    metadata = merge_metadata(
+        RoomMetadata(tenant_name="Participant Tenant"),
+        RoomMetadata(
+            tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+            tenant_name="Room Tenant",
+            phone_number="+201012345678",
+        ),
+    )
+
+    assert metadata == RoomMetadata(
+        tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+        tenant_name="Participant Tenant",
         phone_number="+201012345678",
     )
 
@@ -217,15 +267,16 @@ def test_build_call_analysis_maps_call_summary_to_backend_fields() -> None:
     assert analysis.lead_status == "qualified"
     assert analysis.duration_secs == 60
 
-    details = json.loads(analysis.details)
-    assert details["phone_number"] == "01012345678"
-    assert details["call_id"] == "call-123"
-    assert details["overall_intent"] == "buy_property"
-    assert details["qualification"] == {
-        "area": "التجمع",
-        "bedrooms": 3,
-        "budget": "5000000",
-    }
+    assert analysis.details == "\n".join(
+        [
+            "Phone number: 01012345678",
+            "Budget: 5000000",
+            "Rooms: 3",
+            "Location: التجمع",
+            "Sentiment: positive",
+            "Call outcome: qualified",
+        ]
+    )
 
     payload = build_call_payload(None, analysis)
     assert payload == {
@@ -247,7 +298,13 @@ def test_build_call_analysis_falls_back_when_summary_builder_fails() -> None:
             raise ModuleNotFoundError("No module named 'torch'")
 
     analysis = build_call_analysis(
-        "user: عايز شقة في التجمع",
+        "\n".join(
+            [
+                "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون",
+                "assistant: تمام، محتاج كام غرفة؟",
+                "user: ثلاث غرف ورقمي 01012345678",
+            ]
+        ),
         RoomMetadata(
             tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
             phone_number="+201012345678",
@@ -262,6 +319,62 @@ def test_build_call_analysis_falls_back_when_summary_builder_fails() -> None:
     assert analysis.outcome == "follow_up"
     assert analysis.lead_status == "Follow_Up"
     assert analysis.duration_secs == 30
+
+
+def test_build_call_analysis_uses_summary_duration_when_report_duration_missing() -> (
+    None
+):
+    class DurationCallSummaryBuilder(FakeCallSummaryBuilder):
+        def finalize(self):
+            summary = super().finalize()
+            summary["call_duration_s"] = 75
+            return summary
+
+    analysis = build_call_analysis(
+        "\n".join(
+            [
+                "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون",
+                "assistant: تمام، محتاج كام غرفة؟",
+                "user: ثلاث غرف ورقمي 01012345678",
+            ]
+        ),
+        RoomMetadata(
+            tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+            phone_number="+201012345678",
+        ),
+        duration_secs=None,
+        summary_builder_cls=DurationCallSummaryBuilder,
+    )
+
+    assert analysis.duration_secs == 75
+
+
+def test_build_call_analysis_treats_neutral_qualified_call_as_positive_sentiment() -> (
+    None
+):
+    class NeutralQualifiedCallSummaryBuilder(FakeCallSummaryBuilder):
+        def finalize(self):
+            summary = super().finalize()
+            summary["dominant_emotion"] = "neutral"
+            summary["call_outcome"] = "qualified"
+            return summary
+
+    analysis = build_call_analysis(
+        "\n".join(
+            [
+                "user: انا مهتم بشقة في التجمع، ميزانيتي خمسة مليون",
+                "assistant: تمام، محتاج كام غرفة؟",
+                "user: ثلاث غرف ورقمي 01012345678",
+            ]
+        ),
+        RoomMetadata(
+            tenant_id="d600715c-4ba8-4e94-be2f-9db73abd7654",
+            phone_number="+201012345678",
+        ),
+        summary_builder_cls=NeutralQualifiedCallSummaryBuilder,
+    )
+
+    assert analysis.sentiment == "positive"
 
 
 @pytest.mark.asyncio
@@ -319,6 +432,33 @@ def test_build_call_payload_includes_phone_number_and_status() -> None:
     assert "phone" not in payload
     assert payload["status"] == "Follow_Up"
     assert payload["lead_status"] == "Follow_Up"
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_metadata_tenant_id_looks_up_id_by_name() -> None:
+    fake_connection = FakeConnection()
+
+    async def fake_connect(database_url: str):
+        assert database_url == "postgres://example"
+        return fake_connection
+
+    metadata = await resolve_session_metadata_tenant_id(
+        RoomMetadata(tenant_name="Demo Tenant", phone_number="+201012345678"),
+        database_url="postgres://example",
+        connect=fake_connect,
+    )
+
+    assert metadata == RoomMetadata(
+        tenant_id="550e8400-e29b-41d4-a716-446655440000",
+        tenant_name="Demo Tenant",
+        phone_number="+201012345678",
+    )
+    assert fake_connection.closed is True
+
+    sql, tenant_name = fake_connection.fetchrow_args
+    assert "FROM tenants" in sql
+    assert "lower(name) = lower($1)" in sql
+    assert tenant_name == "Demo Tenant"
 
 
 @pytest.mark.asyncio

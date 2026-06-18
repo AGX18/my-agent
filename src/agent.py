@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import aiohttp
@@ -77,6 +77,8 @@ You are Maya, a friendly real estate agent that answers questions, explains topi
                 - Never say that you booked, scheduled, reserved, sent, shared, forwarded, notified, or will do any of those actions unless a tool for that exact action exists and has succeeded.
                 - If the user says they want an appointment or viewing to see a property, tell them that one of the brokers will contact them to arrange it. Do not say that you personally booked or scheduled it.
                 - If the user asks for an unsupported action, say briefly that you cannot do it directly right now, then offer the useful next step you can do, such as giving the property details or noting the request in the conversation.
+                - if the user go off topic, try to return to the topic and assert this gently
+                - do not ask about phone number since it's already provided before the call
 
                 # Tools
 
@@ -98,6 +100,7 @@ You are Maya, a friendly real estate agent that answers questions, explains topi
 @dataclass(frozen=True)
 class RoomMetadata:
     tenant_id: str | None = None
+    tenant_name: str | None = None
     phone_number: str | None = None
 
 
@@ -131,6 +134,7 @@ def extract_participant_metadata(metadata: str | None) -> RoomMetadata:
 def merge_metadata(primary: RoomMetadata, fallback: RoomMetadata) -> RoomMetadata:
     return RoomMetadata(
         tenant_id=primary.tenant_id or fallback.tenant_id,
+        tenant_name=primary.tenant_name or fallback.tenant_name,
         phone_number=primary.phone_number or fallback.phone_number,
     )
 
@@ -150,9 +154,15 @@ def _extract_metadata(metadata: str | None, source: str) -> RoomMetadata:
         return RoomMetadata()
 
     tenant_id = raw_metadata.get("tenant_id") or raw_metadata.get("tenantId")
+    tenant_name = (
+        raw_metadata.get("tenant_name")
+        or raw_metadata.get("tenantName")
+        or raw_metadata.get("tenant")
+    )
     phone_number = raw_metadata.get("phone_number")
     return RoomMetadata(
         tenant_id=tenant_id if isinstance(tenant_id, str) else None,
+        tenant_name=tenant_name if isinstance(tenant_name, str) else None,
         phone_number=phone_number if isinstance(phone_number, str) else None,
     )
 
@@ -173,9 +183,13 @@ def resolve_tenant_id(
 
 def metadata_from_log_context(log_context_fields: dict[str, Any]) -> RoomMetadata:
     tenant_id = log_context_fields.get("tenant_id")
+    tenant_name = log_context_fields.get("tenant_name")
     phone_number = log_context_fields.get("phone_number")
     return RoomMetadata(
         tenant_id=tenant_id if isinstance(tenant_id, str) and tenant_id else None,
+        tenant_name=tenant_name
+        if isinstance(tenant_name, str) and tenant_name
+        else None,
         phone_number=(
             phone_number if isinstance(phone_number, str) and phone_number else None
         ),
@@ -188,6 +202,54 @@ def _format_pgvector(embedding: list[float]) -> str:
 
 def _tenant_uuid(tenant_id: str) -> str:
     return str(uuid.UUID(tenant_id))
+
+
+async def lookup_tenant_id_by_name(
+    tenant_name: str,
+    *,
+    database_url: str | None = None,
+    connect=asyncpg.connect,
+) -> str | None:
+    db_url = database_url or os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL is not configured")
+
+    conn = await connect(db_url)
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT id
+            FROM tenants
+            WHERE name = lower($1)
+            LIMIT 1
+            """,
+            tenant_name.strip(),
+        )
+    finally:
+        await conn.close()
+
+    if not row:
+        return None
+    return str(row["id"])
+
+
+async def resolve_session_metadata_tenant_id(
+    metadata: RoomMetadata,
+    *,
+    database_url: str | None = None,
+    connect=asyncpg.connect,
+) -> RoomMetadata:
+    if metadata.tenant_id or not metadata.tenant_name:
+        return metadata
+
+    tenant_id = await lookup_tenant_id_by_name(
+        metadata.tenant_name,
+        database_url=database_url,
+        connect=connect,
+    )
+    if not tenant_id:
+        return metadata
+    return replace(metadata, tenant_id=tenant_id)
 
 
 async def _embed_query(query: str, client: AsyncOpenAI | None = None) -> list[float]:
@@ -295,16 +357,43 @@ def transcript_from_session_report(report: dict[str, Any]) -> str:
 
 
 def duration_secs_from_session_report(report: dict[str, Any]) -> int | None:
-    for key in ("duration_secs", "duration_seconds", "session_duration"):
+    duration_keys = {
+        "duration",
+        "duration_s",
+        "duration_sec",
+        "duration_secs",
+        "duration_second",
+        "duration_seconds",
+        "session_duration",
+        "session_duration_s",
+        "session_duration_secs",
+        "elapsed",
+        "elapsed_s",
+        "elapsed_secs",
+    }
+
+    for key in duration_keys:
         value = report.get(key)
         if isinstance(value, int | float):
             return int(value)
 
     usage = report.get("usage")
     if isinstance(usage, dict):
-        for value in usage.values():
-            if isinstance(value, int | float) and "duration" in str(value).lower():
+        for key, value in usage.items():
+            if isinstance(value, int | float) and "duration" in str(key).lower():
                 return int(value)
+
+    for value in report.values():
+        if isinstance(value, dict):
+            duration_secs = duration_secs_from_session_report(value)
+            if duration_secs is not None:
+                return duration_secs
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    duration_secs = duration_secs_from_session_report(item)
+                    if duration_secs is not None:
+                        return duration_secs
 
     return None
 
@@ -321,9 +410,12 @@ def _summary_role(role: str) -> str:
         return "user"
     return "agent"
 
+
 def _add_duration_secs_to_summary_builder(builder: Any, durations_secs) -> None:
-    builder.set_duration_secs(durations_secs)
-    
+    set_duration_secs = getattr(builder, "set_duration_secs", None)
+    if set_duration_secs:
+        set_duration_secs(durations_secs)
+
 
 def _add_transcript_to_summary_builder(builder: Any, transcript: str) -> None:
     for line in transcript.splitlines():
@@ -349,6 +441,19 @@ def _normalize_sentiment(value: Any) -> str:
     return "neutral"
 
 
+def _call_sentiment(summary: dict[str, Any], outcome: str) -> str:
+    sentiment = _normalize_sentiment(
+        summary.get("dominant_emotion") or summary.get("sentiment")
+    )
+    if sentiment != "neutral":
+        return sentiment
+    if outcome == "qualified":
+        return "positive"
+    if outcome == "unqualified":
+        return "negative"
+    return sentiment
+
+
 def _normalize_outcome(value: Any) -> str:
     outcome = str(value or "").strip().lower()
     if outcome in CALL_OUTCOMES:
@@ -356,19 +461,30 @@ def _normalize_outcome(value: Any) -> str:
     return DEFAULT_CALL_OUTCOME
 
 
-def _build_call_details(summary: dict[str, Any], phone_number: str | None) -> str:
-    details = {
-        "phone_number": phone_number,
-        "call_id": summary.get("call_id"),
-        "called_at": summary.get("called_at") or summary.get("timestamp"),
-        "call_outcome": summary.get("call_outcome"),
-        "overall_intent": summary.get("overall_intent"),
-        "dominant_emotion": summary.get("dominant_emotion"),
-        "hesitation_rate": summary.get("hesitation_rate"),
-        "total_user_turns": summary.get("total_user_turns"),
-        "qualification": summary.get("qualification") or {},
-    }
-    return json.dumps(details, ensure_ascii=False)
+def _build_call_details(
+    summary: dict[str, Any],
+    phone_number: str | None,
+    *,
+    sentiment: str,
+    outcome: str,
+) -> str:
+    qualification = summary.get("qualification") or {}
+    if not isinstance(qualification, dict):
+        qualification = {}
+
+    detail_values = [
+        ("Phone number", phone_number),
+        ("Budget", qualification.get("budget")),
+        ("Rooms", qualification.get("bedrooms")),
+        ("Location", qualification.get("area")),
+        ("Property type", qualification.get("property_type")),
+        ("Purpose", qualification.get("purpose")),
+        ("Sentiment", sentiment),
+        ("Call outcome", outcome),
+    ]
+    return "\n".join(
+        f"{label}: {value}" for label, value in detail_values if value not in (None, "")
+    )
 
 
 def build_call_analysis(
@@ -383,7 +499,7 @@ def build_call_analysis(
         builder_cls = summary_builder_cls or _call_summary_builder_class()
         builder = builder_cls(phone=metadata.phone_number or None)
         builder.set_outcome("ongoing")
-        _add_transcript_to_summary_builder(builder, transcript)   
+        _add_transcript_to_summary_builder(builder, transcript)
         _add_duration_secs_to_summary_builder(builder, duration_secs)
         summary_data = builder.finalize()
     except Exception:
@@ -395,17 +511,28 @@ def build_call_analysis(
         summary_data.get("call_outcome") or summary_data.get("classification")
     )
     lead_status = OUTCOME_TO_LEAD_STATUS.get(outcome, DEFAULT_LEAD_STATUS)
-    sentiment = _normalize_sentiment(summary_data.get("dominant_emotion"))
+    sentiment = _call_sentiment(summary_data, outcome)
     summary_text = (
         summary_data.get("summary")
         or summary_data.get("llm_summary")
         or "No call summary was generated."
     )
 
+    summary_duration_secs = summary_data.get("duration_secs") or summary_data.get(
+        "call_duration_s"
+    )
+    if duration_secs is None and isinstance(summary_duration_secs, int | float):
+        duration_secs = int(summary_duration_secs)
+
     return CallAnalysis(
         phone_number=phone_number,
         transcript=transcript,
-        details=_build_call_details(summary_data, phone_number),
+        details=_build_call_details(
+            summary_data,
+            phone_number,
+            sentiment=sentiment,
+            outcome=outcome,
+        ),
         summary=str(summary_text),
         sentiment=sentiment,
         outcome=outcome,
@@ -568,6 +695,16 @@ async def my_agent(ctx: JobContext):
     participant_metadata = extract_participant_metadata(participant.metadata)
     room_metadata = extract_room_metadata(ctx.room.metadata)
     session_metadata = merge_metadata(participant_metadata, room_metadata)
+    if not session_metadata.tenant_id and session_metadata.tenant_name:
+        try:
+            session_metadata = await resolve_session_metadata_tenant_id(
+                session_metadata
+            )
+        except Exception:
+            logger.exception(
+                "Failed to resolve tenant_id for tenant_name=%s",
+                session_metadata.tenant_name,
+            )
 
     # Logging setup
     # Add any other context you want in all log entries here
@@ -575,11 +712,13 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
         "participant": participant.identity,
         "tenant_id": session_metadata.tenant_id or "",
+        "tenant_name": session_metadata.tenant_name or "",
         "phone_number": session_metadata.phone_number or "",
     }
     logger.info(
-        "Extracted participant metadata: tenant_id=%s phone_number=%s participant=%s",
+        "Extracted participant metadata: tenant_id=%s tenant_name=%s phone_number=%s participant=%s",
         session_metadata.tenant_id,
+        session_metadata.tenant_name,
         session_metadata.phone_number,
         participant.identity,
     )

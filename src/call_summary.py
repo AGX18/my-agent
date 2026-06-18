@@ -35,7 +35,6 @@ from dotenv import load_dotenv
 from langdetect import detect
 from openai import OpenAI
 
-
 load_dotenv()
 logger = logging.getLogger("call-summary")
 
@@ -45,6 +44,36 @@ logger = logging.getLogger("call-summary")
 # ============================================
 
 _models: dict = {}
+
+_TRANSFORMER_SENTIMENT_ENV = "CALL_SUMMARY_ENABLE_TRANSFORMERS"
+
+_POSITIVE_WORDS = {
+    "excellent",
+    "good",
+    "great",
+    "interested",
+    "like",
+    "حلو",
+    "تمام",
+    "كويس",
+    "ممتاز",
+    "مناسب",
+    "مهتم",
+    "عجبني",
+}
+
+_NEGATIVE_WORDS = {
+    "bad",
+    "expensive",
+    "not interested",
+    "بلاش",
+    "رفض",
+    "غالي",
+    "مش عايز",
+    "مش مهتم",
+    "مش مناسب",
+    "وحش",
+}
 
 
 def _load_summary_llm() -> None:
@@ -60,18 +89,21 @@ def _load_text_models() -> bool:
     if all(key in _models for key in ("tokenizer_en", "model_en", "sentiment_ar")):
         return True
 
+    if os.getenv(_TRANSFORMER_SENTIMENT_ENV) != "1":
+        logger.info(
+            "Transformer sentiment models disabled. Set %s=1 to enable them.",
+            _TRANSFORMER_SENTIMENT_ENV,
+        )
+        _models["text_models_unavailable"] = True
+        return False
+
     logger.info("⏳ Loading call analysis models...")
     try:
-        from transformers import (
-            AutoModelForSequenceClassification,
-            AutoTokenizer,
-            pipeline,
-        )
+        from transformers import pipeline
     except ImportError as exc:
         logger.warning("Text emotion models are unavailable: %s", exc)
         _models["text_models_unavailable"] = True
         return False
-
 
     # Arabic sentiment (MARBERT — best available for Arabic)
     _models["sentiment_ar"] = pipeline(
@@ -109,25 +141,40 @@ def _preprocess_text(text: str) -> tuple[str, str]:
 # ============================================
 
 
+def _fallback_text_emotion(text: str) -> dict:
+    lower = text.lower()
+    positive_hits = sum(1 for word in _POSITIVE_WORDS if word in lower)
+    negative_hits = sum(1 for word in _NEGATIVE_WORDS if word in lower)
+
+    if positive_hits > negative_hits:
+        return {
+            "sentiment": "positive",
+            "sentiment_score": 0.7,
+            "dominant_emotion": "positive",
+            "confidence": 0.7,
+        }
+    if negative_hits > positive_hits:
+        return {
+            "sentiment": "negative",
+            "sentiment_score": 0.7,
+            "dominant_emotion": "negative",
+            "confidence": 0.7,
+        }
+    return {
+        "sentiment": "neutral",
+        "sentiment_score": 0.5,
+        "dominant_emotion": "neutral",
+        "confidence": 0.5,
+    }
+
+
 def _run_text_emotion(text: str, lang: str) -> dict:
     """Detect emotion from text using loaded models."""
     if not _load_text_models():
-        return {"dominant_emotion": "neutral", "confidence": 0.5}
-
-    torch = _models["torch"]
+        return _fallback_text_emotion(text)
 
     if lang == "en":
-        inputs = _models["tokenizer_en"](
-            text, return_tensors="pt", truncation=True, max_length=512
-        )
-        with torch.no_grad():
-            logits = _models["model_en"](**inputs).logits
-        probs = torch.softmax(logits, dim=-1)[0]
-        label = _models["model_en"].config.id2label[int(torch.argmax(probs))]
-        return {
-            "dominant_emotion": label,
-            "confidence": round(float(torch.max(probs)), 3),
-        }
+        return _fallback_text_emotion(text)
 
     # Arabic
     try:
@@ -146,7 +193,7 @@ def _run_text_emotion(text: str, lang: str) -> dict:
             result["dominant_emotion"] = "neutral"
         return result
     except Exception:
-        return {"dominant_emotion": "neutral", "confidence": 0.5}
+        return _fallback_text_emotion(text)
 
 
 # ============================================
@@ -459,6 +506,7 @@ def _extract_phone_from_turns(turns: list[dict]) -> Optional[str]:
 # 		"outcome":"qualified",
 # 		"duration_secs":90
 
+
 class CallSummaryBuilder:
     """
     Lives inside MayaAgent for the duration of a call.
@@ -480,7 +528,7 @@ class CallSummaryBuilder:
         self.confirmed_qual: dict = {}
         self.phone: Optional[str] = phone.strip() if phone else None
         self.duration_secs = None
-        
+
     def set_duration_secs(self, duration_secs):
         self.duration_secs = duration_secs
 
@@ -596,7 +644,9 @@ class CallSummaryBuilder:
         except Exception as e:
             logger.warning(f"⚠️ Overall intent derivation failed: {e}")
             # Fallback: return the most common intent from the timeline
-            return Counter(row.get("intent", "unknown") for row in timeline_rows).most_common(1)[0][0]
+            return Counter(
+                row.get("intent", "unknown") for row in timeline_rows
+            ).most_common(1)[0][0]
 
     def _extract_qual_from_summary(self, llm_summary: str) -> dict:
         """
@@ -733,7 +783,11 @@ class CallSummaryBuilder:
             "call_id": self.call_id,
             "client_name": self.client_name,
             "call_outcome": self.call_outcome,
-            "call_duration_s": int((datetime.now() - self.start_time).total_seconds()),
+            "call_duration_s": int(
+                self.duration_secs
+                if self.duration_secs is not None
+                else (datetime.now() - self.start_time).total_seconds()
+            ),
             "total_user_turns": total,
             "dominant_emotion": top_emotion,
             "overall_intent": overall_intent,  # ← replaces top_intent (LLM-derived)
