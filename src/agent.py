@@ -24,6 +24,7 @@ from livekit.agents import (
 from livekit.plugins import ai_coustics, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
 logger = logging.getLogger("agent")
 
@@ -31,12 +32,14 @@ load_dotenv(".env.local")
 
 AGENT_MODEL = "openai/gpt-5.2-chat-latest"
 EMBEDDING_MODEL = "text-embedding-3-small"
+CALL_ANALYSIS_MODEL = os.getenv("CALL_ANALYSIS_MODEL", "gpt-4.1-mini")
 DEFAULT_PROPERTY_SEARCH_LIMIT = 4
 DEFAULT_CALL_OUTCOME = "follow_up"
 DEFAULT_LEAD_STATUS = "Follow_Up"
 CALL_SENTIMENTS = {"positive", "negative", "neutral"}
 CALL_OUTCOMES = {"follow_up", "qualified", "closed", "unqualified", "no_answer"}
 LEAD_STATUSES = {"Follow_Up", "qualified", "closed", "unqualified"}
+CALL_INTENTS = {"buy", "rent"}
 OUTCOME_TO_LEAD_STATUS = {
     "follow_up": "Follow_Up",
     "qualified": "qualified",
@@ -77,6 +80,8 @@ You are Maya, a friendly real estate agent that answers questions, explains topi
                 - Never say that you booked, scheduled, reserved, sent, shared, forwarded, notified, or will do any of those actions unless a tool for that exact action exists and has succeeded.
                 - If the user says they want an appointment or viewing to see a property, tell them that one of the brokers will contact them to arrange it. Do not say that you personally booked or scheduled it.
                 - If the user asks for an unsupported action, say briefly that you cannot do it directly right now, then offer the useful next step you can do, such as giving the property details or noting the request in the conversation.
+                - if the user go off topic, try to return to the topic and assert this gently
+                - do not ask about phone number since it's already provided before the call
 
                 # Tools
 
@@ -98,6 +103,7 @@ You are Maya, a friendly real estate agent that answers questions, explains topi
 @dataclass(frozen=True)
 class RoomMetadata:
     tenant_id: str | None = None
+    tenant_name: str | None = None
     phone_number: str | None = None
 
 
@@ -116,6 +122,8 @@ class CallAnalysis:
     sentiment: str
     outcome: str
     lead_status: str
+    lead_summary: str = ""
+    intent: str = "buy"
     duration_secs: int | None = None
 
 
@@ -130,6 +138,7 @@ def extract_participant_metadata(metadata: str | None) -> RoomMetadata:
 def merge_metadata(primary: RoomMetadata, fallback: RoomMetadata) -> RoomMetadata:
     return RoomMetadata(
         tenant_id=primary.tenant_id or fallback.tenant_id,
+        tenant_name=primary.tenant_name or fallback.tenant_name,
         phone_number=primary.phone_number or fallback.phone_number,
     )
 
@@ -149,9 +158,11 @@ def _extract_metadata(metadata: str | None, source: str) -> RoomMetadata:
         return RoomMetadata()
 
     tenant_id = raw_metadata.get("tenant_id") or raw_metadata.get("tenantId")
+    tenant_name = raw_metadata.get("tenant_name") or raw_metadata.get("tenantName")
     phone_number = raw_metadata.get("phone_number")
     return RoomMetadata(
         tenant_id=tenant_id if isinstance(tenant_id, str) else None,
+        tenant_name=tenant_name if isinstance(tenant_name, str) else None,
         phone_number=phone_number if isinstance(phone_number, str) else None,
     )
 
@@ -172,9 +183,13 @@ def resolve_tenant_id(
 
 def metadata_from_log_context(log_context_fields: dict[str, Any]) -> RoomMetadata:
     tenant_id = log_context_fields.get("tenant_id")
+    tenant_name = log_context_fields.get("tenant_name")
     phone_number = log_context_fields.get("phone_number")
     return RoomMetadata(
         tenant_id=tenant_id if isinstance(tenant_id, str) and tenant_id else None,
+        tenant_name=tenant_name
+        if isinstance(tenant_name, str) and tenant_name
+        else None,
         phone_number=(
             phone_number if isinstance(phone_number, str) and phone_number else None
         ),
@@ -196,6 +211,64 @@ async def _embed_query(query: str, client: AsyncOpenAI | None = None) -> list[fl
         input=query,
     )
     return response.data[0].embedding
+
+
+async def resolve_tenant_id_from_name(
+    tenant_name: str,
+    *,
+    database_url: str | None = None,
+    connect=asyncpg.connect,
+) -> str | None:
+    if not tenant_name.strip():
+        return None
+
+    db_url = database_url or os.getenv("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("DATABASE_URL is not configured")
+
+    conn = await connect(db_url)
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT id
+            FROM tenants
+            WHERE lower(name) = lower($1)
+            LIMIT 1
+            """,
+            tenant_name.strip(),
+        )
+    finally:
+        await conn.close()
+
+    if not row:
+        return None
+
+    tenant_id = row["id"]
+    return str(tenant_id) if tenant_id is not None else None
+
+
+async def resolve_metadata_tenant_id(
+    metadata: RoomMetadata,
+    *,
+    database_url: str | None = None,
+    connect=asyncpg.connect,
+) -> RoomMetadata:
+    if metadata.tenant_id or not metadata.tenant_name:
+        return metadata
+
+    tenant_id = await resolve_tenant_id_from_name(
+        metadata.tenant_name,
+        database_url=database_url,
+        connect=connect,
+    )
+    if not tenant_id:
+        return metadata
+
+    return RoomMetadata(
+        tenant_id=tenant_id,
+        tenant_name=metadata.tenant_name,
+        phone_number=metadata.phone_number,
+    )
 
 
 async def search_property_embeddings(
@@ -319,8 +392,10 @@ def build_call_analysis(
     outcome = _classify_outcome(client_transcript)
     lead_status = OUTCOME_TO_LEAD_STATUS[outcome]
     preferences = _extract_client_preferences(client_transcript)
-    details = _format_call_details(metadata, preferences, sentiment, outcome)
-    summary = _format_call_summary(metadata, preferences, sentiment, outcome)
+    intent = _classify_intent(client_transcript)
+    details = _format_call_details(metadata, preferences, sentiment, outcome, intent)
+    summary = _format_call_summary(metadata, preferences, sentiment, outcome, intent)
+    lead_summary = _format_lead_summary(preferences, intent)
 
     return CallAnalysis(
         transcript=transcript,
@@ -329,8 +404,104 @@ def build_call_analysis(
         sentiment=sentiment,
         outcome=outcome,
         lead_status=lead_status,
+        lead_summary=lead_summary,
+        intent=intent,
         duration_secs=duration_secs,
     )
+
+
+def build_call_analysis_messages(
+    transcript: str,
+    metadata: RoomMetadata,
+    *,
+    duration_secs: int | None = None,
+) -> list[ChatCompletionMessageParam]:
+    return [
+        {
+            "role": "system",
+            "content": """
+You analyze real estate voice call transcripts and create one backend payload.
+
+Return only one JSON object. Do not wrap it in markdown or add commentary.
+The JSON object must contain exactly these keys:
+- phone_number: string or null. Use the provided metadata phone number, not a number guessed from the transcript.
+- lead_status: one of "Follow_Up", "qualified", "closed", "unqualified". This must match the outcome mapping below.
+- outcome: one of "follow_up", "qualified", "closed", "unqualified", "no_answer".
+- sentiment: one of "positive", "negative", "neutral".
+- duration_secs: integer or null.
+- transcript: the full transcript exactly as provided.
+- details: a multiline string with these labels: Phone number, Budget, Rooms, Location, Property type, Sentiment, Call outcome. Use "Not captured" for missing values.
+- call_summary: one short English sentence summarizing the call outcome.
+- lead_summary: one short English sentence describing what the lead wants and the lead characteristics.
+- intent: one of "buy", "rent".
+
+Allowed values:
+- DEFAULT_CALL_OUTCOME = "follow_up"
+- DEFAULT_LEAD_STATUS = "Follow_Up"
+- CALL_SENTIMENTS = {"positive", "negative", "neutral"}
+- CALL_OUTCOMES = {"follow_up", "qualified", "closed", "unqualified", "no_answer"}
+- LEAD_STATUSES = {"Follow_Up", "qualified", "closed", "unqualified"}
+- CALL_INTENTS = {"buy", "rent"}
+- OUTCOME_TO_LEAD_STATUS = {
+    "follow_up": "Follow_Up",
+    "qualified": "qualified",
+    "closed": "closed",
+    "unqualified": "unqualified",
+    "no_answer": "Follow_Up",
+  }
+
+Rules:
+- Extract customer preferences only from user/client/customer lines. Do not treat assistant property suggestions as customer preferences.
+- If the user is not interested, cannot afford the property, rejects the offer, or asks not to continue, use outcome "unqualified".
+- If there is no customer speech, use outcome "no_answer" and sentiment "neutral".
+- If the customer gives buying/renting preferences and remains interested, use outcome "qualified".
+- If the customer wants more time, asks to be contacted later, or the call has no final decision, use outcome "follow_up".
+- Set lead_status from OUTCOME_TO_LEAD_STATUS[outcome].
+- Set intent to "rent" when the customer wants to rent or lease. Otherwise set intent to "buy".
+- Preserve the provided transcript exactly in the transcript field.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": "\n".join(
+                [
+                    f"Metadata phone_number: {metadata.phone_number or 'null'}",
+                    f"Duration seconds: {duration_secs if duration_secs is not None else 'null'}",
+                    "Transcript:",
+                    transcript,
+                ]
+            ),
+        },
+    ]
+
+
+async def build_llm_call_analysis(
+    transcript: str,
+    metadata: RoomMetadata,
+    *,
+    duration_secs: int | None = None,
+    openai_client: AsyncOpenAI | None = None,
+) -> CallAnalysis:
+    client = openai_client or AsyncOpenAI()
+    response = await client.chat.completions.create(
+        model=CALL_ANALYSIS_MODEL,
+        messages=build_call_analysis_messages(
+            transcript,
+            metadata,
+            duration_secs=duration_secs,
+        ),
+        response_format={"type": "json_object"},
+        temperature=0,
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise ValueError("Call analysis LLM returned an empty response")
+
+    payload = json.loads(content)
+    if not isinstance(payload, dict):
+        raise ValueError("Call analysis LLM response must be a JSON object")
+
+    return _call_analysis_from_payload(payload, transcript, duration_secs)
 
 
 async def persist_call_analysis(
@@ -347,7 +518,7 @@ async def persist_call_analysis(
 
     payload = build_call_payload(phone_number, analysis)
     normalized_tenant_id = _tenant_uuid(tenant_id)
-    url = f"{base_url}/tenants/{normalized_tenant_id}/calls"
+    url = f"{base_url}/v2/tenants/{normalized_tenant_id}/calls"
     headers = {"Content-Type": "application/json"}
     backend_api_key = os.getenv("BACKEND_API_KEY")
     if backend_api_key:
@@ -380,15 +551,89 @@ def build_call_payload(
 ) -> dict[str, Any]:
     return {
         "phone_number": phone_number,
-        "status": analysis.lead_status,
         "lead_status": analysis.lead_status,
+        "outcome": analysis.outcome,
+        "sentiment": analysis.sentiment,
+        "duration_secs": analysis.duration_secs,
         "transcript": analysis.transcript,
         "details": analysis.details,
-        "summary": analysis.summary,
-        "sentiment": analysis.sentiment,
-        "outcome": analysis.outcome,
-        "duration_secs": analysis.duration_secs,
+        "call_summary": analysis.summary,
     }
+
+
+def _call_analysis_from_payload(
+    payload: dict[str, Any],
+    fallback_transcript: str,
+    fallback_duration_secs: int | None,
+) -> CallAnalysis:
+    sentiment = payload.get("sentiment")
+    outcome = payload.get("outcome")
+    intent = payload.get("intent")
+
+    if sentiment not in CALL_SENTIMENTS:
+        raise ValueError(f"Invalid call sentiment: {sentiment!r}")
+    if outcome not in CALL_OUTCOMES:
+        raise ValueError(f"Invalid call outcome: {outcome!r}")
+    if intent not in CALL_INTENTS:
+        raise ValueError(f"Invalid call intent: {intent!r}")
+
+    details = payload.get("details")
+    summary = payload.get("call_summary")
+    lead_summary = payload.get("lead_summary")
+    transcript = payload.get("transcript")
+    duration_secs = payload.get("duration_secs")
+
+    if not isinstance(details, str) or not details.strip():
+        raise ValueError("Call analysis details must be a non-empty string")
+    details = _normalize_details_intent(details, intent)
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("Call analysis call_summary must be a non-empty string")
+    if not isinstance(lead_summary, str) or not lead_summary.strip():
+        raise ValueError("Call analysis lead_summary must be a non-empty string")
+    if not isinstance(transcript, str) or transcript != fallback_transcript:
+        transcript = fallback_transcript
+    if not isinstance(duration_secs, int):
+        duration_secs = fallback_duration_secs
+
+    return CallAnalysis(
+        transcript=transcript,
+        details=details,
+        summary=summary,
+        sentiment=sentiment,
+        outcome=outcome,
+        lead_status=OUTCOME_TO_LEAD_STATUS[outcome],
+        lead_summary=lead_summary,
+        intent=intent,
+        duration_secs=duration_secs,
+    )
+
+
+def _normalize_details_intent(details: str, intent: str) -> str:
+    lines = details.splitlines()
+    normalized_lines = []
+    intent_written = False
+
+    for line in lines:
+        label, separator, _ = line.partition(":")
+        if separator and label.strip().lower() == "intent":
+            if not intent_written:
+                normalized_lines.append(f"Intent: {intent}")
+                intent_written = True
+            continue
+        normalized_lines.append(line)
+
+    if intent_written:
+        return "\n".join(normalized_lines)
+
+    insert_at = len(normalized_lines)
+    for index, line in enumerate(normalized_lines):
+        label, separator, _ = line.partition(":")
+        if separator and label.strip().lower() == "sentiment":
+            insert_at = index
+            break
+
+    normalized_lines.insert(insert_at, f"Intent: {intent}")
+    return "\n".join(normalized_lines)
 
 
 def _content_to_text(content: Any) -> str:
@@ -467,11 +712,32 @@ def _classify_outcome(transcript: str) -> str:
     return DEFAULT_CALL_OUTCOME
 
 
+def _classify_intent(transcript: str) -> str:
+    normalized = transcript.lower()
+    rent_keywords = (
+        "rent",
+        "rental",
+        "lease",
+        "ايجار",
+        "إيجار",
+        "أأجر",
+        "اجار",
+        "أجار",
+        "أجر",
+        "تأجير",
+        "استئجار",
+    )
+    if any(keyword.lower() in normalized for keyword in rent_keywords):
+        return "rent"
+    return "buy"
+
+
 def _format_call_details(
     metadata: RoomMetadata,
     preferences: dict[str, str],
     sentiment: str,
     outcome: str,
+    intent: str,
 ) -> str:
     return "\n".join(
         [
@@ -480,6 +746,7 @@ def _format_call_details(
             f"Rooms: {preferences['rooms']}",
             f"Location: {preferences['location']}",
             f"Property type: {preferences['property_type']}",
+            f"Intent: {intent}",
             f"Sentiment: {sentiment}",
             f"Call outcome: {outcome}",
         ]
@@ -491,14 +758,26 @@ def _format_call_summary(
     preferences: dict[str, str],
     sentiment: str,
     outcome: str,
+    intent: str,
 ) -> str:
     return (
         f"Call with {metadata.phone_number or 'unknown phone number'}. "
+        f"Intent: {intent}. "
         f"Client budget: {preferences['budget']}. "
         f"Rooms: {preferences['rooms']}. "
         f"Location: {preferences['location']}. "
         f"Property type: {preferences['property_type']}. "
         f"Outcome: {outcome}. Sentiment: {sentiment}."
+    )
+
+
+def _format_lead_summary(preferences: dict[str, str], intent: str) -> str:
+    return (
+        f"Lead wants to {intent}. "
+        f"Budget: {preferences['budget']}. "
+        f"Rooms: {preferences['rooms']}. "
+        f"Location: {preferences['location']}. "
+        f"Property type: {preferences['property_type']}."
     )
 
 
@@ -556,11 +835,19 @@ async def on_session_end(ctx: JobContext) -> None:
     report_dict = report.to_dict()
     transcript = transcript_from_session_report(report_dict)
     duration_secs = duration_secs_from_session_report(report_dict)
-    analysis = build_call_analysis(
-        transcript,
-        metadata,
-        duration_secs=duration_secs,
-    )
+    try:
+        analysis = await build_llm_call_analysis(
+            transcript,
+            metadata,
+            duration_secs=duration_secs,
+        )
+    except Exception:
+        logger.exception("Falling back to rule-based call analysis")
+        analysis = build_call_analysis(
+            transcript,
+            metadata,
+            duration_secs=duration_secs,
+        )
 
     try:
         call_id, lead_id = await persist_call_analysis(
@@ -590,6 +877,10 @@ async def my_agent(ctx: JobContext):
     participant_metadata = extract_participant_metadata(participant.metadata)
     room_metadata = extract_room_metadata(ctx.room.metadata)
     session_metadata = merge_metadata(participant_metadata, room_metadata)
+    try:
+        session_metadata = await resolve_metadata_tenant_id(session_metadata)
+    except Exception:
+        logger.exception("Failed to resolve tenant_id from tenant_name")
 
     # Logging setup
     # Add any other context you want in all log entries here
@@ -597,11 +888,13 @@ async def my_agent(ctx: JobContext):
         "room": ctx.room.name,
         "participant": participant.identity,
         "tenant_id": session_metadata.tenant_id or "",
+        "tenant_name": session_metadata.tenant_name or "",
         "phone_number": session_metadata.phone_number or "",
     }
     logger.info(
-        "Extracted participant metadata: tenant_id=%s phone_number=%s participant=%s",
+        "Extracted participant metadata: tenant_id=%s tenant_name=%s phone_number=%s participant=%s",
         session_metadata.tenant_id,
+        session_metadata.tenant_name,
         session_metadata.phone_number,
         participant.identity,
     )
@@ -626,16 +919,6 @@ async def my_agent(ctx: JobContext):
         # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
     )
-
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
 
     # Start the session, which initializes the voice pipeline and warms up the models
     await session.start(
