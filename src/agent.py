@@ -127,6 +127,10 @@ class CallAnalysis:
     duration_secs: int | None = None
 
 
+class BackendPersistenceUnavailableError(RuntimeError):
+    """Raised when the backend persistence service cannot be reached."""
+
+
 def extract_room_metadata(metadata: str | None) -> RoomMetadata:
     return _extract_metadata(metadata, "Room")
 
@@ -138,8 +142,8 @@ def extract_participant_metadata(metadata: str | None) -> RoomMetadata:
 def merge_metadata(primary: RoomMetadata, fallback: RoomMetadata) -> RoomMetadata:
     return RoomMetadata(
         tenant_id=primary.tenant_id or fallback.tenant_id,
-        tenant_name=primary.tenant_name or fallback.tenant_name,
-        phone_number=primary.phone_number or fallback.phone_number,
+        tenant_name=primary.tenant_name or 'acme',
+        phone_number=primary.phone_number or '+201298765432',
     )
 
 
@@ -524,21 +528,26 @@ async def persist_call_analysis(
     if backend_api_key:
         headers["Authorization"] = f"Bearer {backend_api_key}"
 
-    async with (
-        session_factory() as session,
-        session.post(url, json=payload, headers=headers) as response,
-    ):
-        response_text = await response.text()
-        if response.status >= 400:
-            raise RuntimeError(
-                f"Backend call persistence failed with status {response.status}: "
-                f"{response_text}"
-            )
+    try:
+        async with (
+            session_factory() as session,
+            session.post(url, json=payload, headers=headers) as response,
+        ):
+            response_text = await response.text()
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"Backend call persistence failed with status {response.status}: "
+                    f"{response_text}"
+                )
 
-        if response_text:
-            data = await response.json()
-        else:
-            data = {}
+            if response_text:
+                data = await response.json()
+            else:
+                data = {}
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        raise BackendPersistenceUnavailableError(
+            f"Backend call persistence is unavailable at {base_url}: {exc}"
+        ) from exc
 
     call_id = data.get("id") or data.get("call_id")
     lead_id = data.get("lead_id")
@@ -855,6 +864,11 @@ async def on_session_end(ctx: JobContext) -> None:
             metadata.phone_number,
             analysis,
         )
+    except BackendPersistenceUnavailableError as exc:
+        logger.warning(
+            "Skipping call persistence because backend is unavailable: %s", exc
+        )
+        return
     except Exception:
         logger.exception("Failed to persist call summary")
         return

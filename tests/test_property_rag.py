@@ -1,10 +1,12 @@
 import json
 from typing import ClassVar
 
+import aiohttp
 import pytest
 
 from agent import (
     ASSISTANT_INSTRUCTIONS,
+    BackendPersistenceUnavailableError,
     CallAnalysis,
     PropertySearchResult,
     RoomMetadata,
@@ -158,6 +160,17 @@ class FakeHttpSession:
             "headers": headers,
         }
         return FakeHttpResponse()
+
+
+class FakeUnavailableHttpSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return None
+
+    def post(self, url, *, json, headers):
+        raise aiohttp.ClientConnectionError("connection refused")
 
 
 def test_assistant_instructions_do_not_overpromise_unsupported_actions() -> None:
@@ -418,6 +431,33 @@ async def test_persist_call_analysis_posts_to_backend_endpoint() -> None:
         "details": analysis.details,
         "call_summary": analysis.summary,
     }
+
+
+@pytest.mark.asyncio
+async def test_persist_call_analysis_reports_unavailable_backend() -> None:
+    analysis = CallAnalysis(
+        transcript="user: عايز شقة في التجمع",
+        details="Phone number: +201012345678\nCall outcome: qualified",
+        summary="Call with +201012345678. Outcome: qualified. Sentiment: positive.",
+        sentiment="positive",
+        outcome="qualified",
+        lead_status="qualified",
+        lead_summary="Lead wants to buy an apartment in New Cairo.",
+        intent="buy",
+        duration_secs=90,
+    )
+
+    with pytest.raises(
+        BackendPersistenceUnavailableError,
+        match=r"backend\.example\.com",
+    ):
+        await persist_call_analysis(
+            "d600715c-4ba8-4e94-be2f-9db73abd7654",
+            "+201012345678",
+            analysis,
+            backend_base_url="https://backend.example.com",
+            session_factory=FakeUnavailableHttpSession,
+        )
 
 
 def test_build_call_payload_includes_phone_number_and_status() -> None:
